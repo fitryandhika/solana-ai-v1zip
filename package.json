@@ -15,14 +15,14 @@
     "@solana/web3.js": "^1.95.3",
     "@supabase/supabase-js": "^2.45.4",
     "dotenv": "^16.4.5",
-    "next": "^14.2.30",
+    "next": "^14.2.35",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "eslint": "^8.57.0",
-    "eslint-config-next": "^14.2.30"
+    "eslint-config-next": "^14.2.35"
   },
   "engines": {
     "node": ">=18.17.0"
