@@ -1,3 +1,14 @@
+modules = ["nodejs-24"]
 [nix]
 channel = "stable-25_05"
 packages = ["unzip"]
+
+[userenv]
+
+[userenv.shared]
+DEMO_MODE = "false"
+DEXSCREENER_API_BASE_URL = "https://api.dexscreener.com"
+MARKET_POLL_INTERVAL_MS = "10000"
+SCANNER_RECONNECT_DELAY_MS = "5000"
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+SOLANA_WS_URL = "wss://api.mainnet-beta.solana.com"
