@@ -23,8 +23,8 @@ require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env"
 
 const { SolanaDiscoveryStream } = require("../lib/solana/websocket");
 const dexscreener = require("../lib/providers/dexscreener");
-const { upsertToken, listRecentTokens, getCreatorHistory } = require("../lib/database/tokens");
-const { insertSnapshot, getBaselineSnapshot, getSnapshotAtOrAfter, getFirstSnapshot } = require("../lib/database/snapshots");
+const { upsertToken, listRecentTokens, getCreatorHistory, getTotalTokenCount } = require("../lib/database/tokens");
+const { insertSnapshot, getBaselineSnapshot, getSnapshotAtOrAfter, getFirstSnapshot, getTotalAnalyzedCount } = require("../lib/database/snapshots");
 const { getServiceClient } = require("../lib/database/supabase");
 const { calculateVolumeRatio, calculateMomentumScore, calculateBuyPressureScore } = require("../lib/analyzer/momentum");
 const { calculateOpportunityScore, classifySignal } = require("../lib/analyzer/opportunity");
@@ -461,6 +461,19 @@ async function loadExistingTokens() {
     log(`resumed tracking ${trackedAddresses.size} existing tokens`);
   } catch (err) {
     log("failed to load existing tokens:", errMsg(err));
+  }
+
+  // tokensDiscoveredCount/tokensAnalyzedCount are in-memory counters that
+  // otherwise reset to 0 on every restart even though the underlying data
+  // in Supabase is untouched — resuming them here keeps the dashboard's
+  // "Tokens Discovered"/"Tokens Analyzed" figures accurate across restarts.
+  try {
+    tokensDiscoveredCount = await getTotalTokenCount();
+    tokensAnalyzedCount = await getTotalAnalyzedCount();
+    await updateStatus({ tokens_discovered: tokensDiscoveredCount, tokens_analyzed: tokensAnalyzedCount });
+    log(`resumed counters: ${tokensDiscoveredCount} discovered, ${tokensAnalyzedCount} analyzed`);
+  } catch (err) {
+    log("failed to resume discovered/analyzed counters:", errMsg(err));
   }
 
   try {
