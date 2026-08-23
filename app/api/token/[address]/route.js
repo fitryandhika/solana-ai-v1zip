@@ -6,8 +6,6 @@ import { getTokenByAddress } from "../../../../lib/database/tokens";
 import { getLatestSnapshot, getRecentSnapshots } from "../../../../lib/database/snapshots";
 import { computeTokenAgeMinutes } from "../../../../lib/utils/format";
 
-// Force this route to run fresh on every request rather than being cached
-// as static output at build time (see app/api/scanner/route.js for why).
 export const dynamic = "force-dynamic";
 
 export async function GET(_request, { params }) {
