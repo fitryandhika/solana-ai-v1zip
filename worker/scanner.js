@@ -1,10 +1,4 @@
 // worker/scanner.js
-//
-// Standalone Node process — NOT a Vercel serverless function (spec section
-// 29/30). Run locally with `npm run scanner`. In production this must run
-// somewhere that supports a long-lived process (a small VM, Railway, Fly.io,
-// a Render background worker, etc). It writes to the SAME Supabase project
-// as the Next.js app, which only ever reads from Supabase.
 
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
@@ -241,6 +235,10 @@ async function main() {
 
   stream.on("candidate", ({ address }) => {
     tryHandleCandidate(address);
+  });
+
+  stream.on("debug", (message) => {
+    log("debug:", message);
   });
 
   stream.on("reconnecting", ({ delay, attempt }) => {
