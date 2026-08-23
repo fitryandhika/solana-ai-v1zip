@@ -1,4 +1,10 @@
 // worker/scanner.js
+//
+// Standalone Node process — NOT a Vercel serverless function (spec section
+// 29/30). Run locally with `npm run scanner`. In production this must run
+// somewhere that supports a long-lived process (a small VM, Railway, Fly.io,
+// a Render background worker, etc). It writes to the SAME Supabase project
+// as the Next.js app, which only ever reads from Supabase.
 
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
@@ -189,6 +195,34 @@ function stopFallbackPolling() {
   }
 }
 
+// Trending discovery — finds tokens that are ALREADY established but showing
+// renewed activity, not just brand-new ones. Runs continuously alongside the
+// realtime stream, feeding the same confirm → track → score pipeline.
+const TRENDING_POLL_INTERVAL_MS = Number(process.env.TRENDING_POLL_INTERVAL_MS || 300000);
+let trendingTimer = null;
+
+function startTrendingPolling() {
+  if (trendingTimer) return;
+  log("starting trending-token discovery polling");
+  trendingTimer = setInterval(async () => {
+    try {
+      const addresses = await dexscreener.pollRecentSolanaPairs();
+      for (const address of addresses) {
+        await handleCandidate(address);
+      }
+    } catch (err) {
+      log("trending polling error:", errMsg(err));
+    }
+  }, TRENDING_POLL_INTERVAL_MS);
+}
+
+function stopTrendingPolling() {
+  if (trendingTimer) {
+    clearInterval(trendingTimer);
+    trendingTimer = null;
+  }
+}
+
 async function loadExistingTokens() {
   try {
     const tokens = await listRecentTokens(500);
@@ -255,6 +289,8 @@ async function main() {
 
   stream.start();
 
+  startTrendingPolling();
+
   setInterval(() => {
     pollTrackedTokens().catch((err) => log("poll loop error:", errMsg(err)));
   }, MARKET_POLL_INTERVAL_MS);
@@ -263,6 +299,7 @@ async function main() {
     log("shutting down");
     stream.stop();
     stopFallbackPolling();
+    stopTrendingPolling();
     setStatus("OFFLINE").finally(() => process.exit(0));
   });
 }
