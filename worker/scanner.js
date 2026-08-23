@@ -71,16 +71,20 @@ function errMsg(err) {
 // scanner_status helpers
 // ---------------------------------------------------------------------------
 
+// scanner_status is meant to hold exactly one row. Using a fixed, known id
+// with upsert (instead of "select the existing row, then insert or update")
+// makes that a real guarantee enforced by the database's primary key,
+// rather than a race between whatever processes happen to call this at the
+// same time — which is what created duplicate rows before.
+const SCANNER_STATUS_ROW_ID = "00000000-0000-0000-0000-000000000001";
+
 async function updateStatus(patch) {
   try {
     const supabase = getServiceClient();
-    const { data: existing } = await supabase.from("scanner_status").select("id").limit(1).maybeSingle();
-
-    if (existing) {
-      await supabase.from("scanner_status").update(patch).eq("id", existing.id);
-    } else {
-      await supabase.from("scanner_status").insert(patch);
-    }
+    await supabase.from("scanner_status").upsert(
+      { id: SCANNER_STATUS_ROW_ID, ...patch },
+      { onConflict: "id" }
+    );
   } catch (err) {
     log("failed to update scanner_status:", errMsg(err));
   }
