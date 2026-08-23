@@ -5,18 +5,6 @@
 // somewhere that supports a long-lived process (a small VM, Railway, Fly.io,
 // a Render background worker, etc). It writes to the SAME Supabase project
 // as the Next.js app, which only ever reads from Supabase.
-//
-// Flow per spec section 30:
-//   1. Connect to Solana WebSocket.
-//   2. Listen for relevant events.
-//   3. Identify candidate token/pair activity.
-//   4. Query DexScreener.
-//   5. Confirm tradable pair.
-//   6. Insert token if new.
-//   7. Start collecting snapshots.
-//   8. Calculate score.
-//   9. Store snapshot.
-//   10. Continue monitoring.
 
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
@@ -32,23 +20,11 @@ const { computeTokenAgeMinutes } = require("../lib/utils/format");
 
 const MARKET_POLL_INTERVAL_MS = Number(process.env.MARKET_POLL_INTERVAL_MS || 10000);
 const RECONNECT_DELAY_MS = Number(process.env.SCANNER_RECONNECT_DELAY_MS || 5000);
-const FALLBACK_POLL_INTERVAL_MS = 60000; // conservative, per spec section 5
+const FALLBACK_POLL_INTERVAL_MS = 60000;
 
-// Raw Solana program logs are noisy — the candidate-address heuristic in
-// lib/solana/websocket.js can match many non-token substrings per log line.
-// Without a cap, a burst of candidates each opens an outbound DexScreener
-// request, which can exhaust the container's ephemeral ports and get the
-// process killed. Capping concurrent candidate handling (and simply
-// dropping candidates over the cap — they're speculative anyway) keeps
-// outbound connections bounded regardless of how bursty the chain gets.
 const MAX_CONCURRENT_CANDIDATES = Number(process.env.MAX_CONCURRENT_CANDIDATES || 3);
 let activeCandidateCount = 0;
 
-// last_event_at fires on every single program-log event, which on a busy
-// Solana program can be hundreds per second. Writing to Supabase that often
-// floods the database and the process's own connection pool. Throttle it to
-// at most once every few seconds — it only feeds a "last scan" display, so
-// sub-second freshness isn't needed.
 const EVENT_STATUS_THROTTLE_MS = 5000;
 let lastEventStatusUpdate = 0;
 
@@ -60,22 +36,11 @@ function log(...args) {
   console.log(`[scanner ${new Date().toISOString()}]`, ...args);
 }
 
-// Rejections aren't always Error instances (a caught non-Error throw, or a
-// rejection value that's undefined), so never assume err.message exists.
 function errMsg(err) {
   if (!err) return "unknown error";
   return err.message || String(err);
 }
 
-// ---------------------------------------------------------------------------
-// scanner_status helpers
-// ---------------------------------------------------------------------------
-
-// scanner_status is meant to hold exactly one row. Using a fixed, known id
-// with upsert (instead of "select the existing row, then insert or update")
-// makes that a real guarantee enforced by the database's primary key,
-// rather than a race between whatever processes happen to call this at the
-// same time — which is what created duplicate rows before.
 const SCANNER_STATUS_ROW_ID = "00000000-0000-0000-0000-000000000001";
 
 async function updateStatus(patch) {
@@ -94,17 +59,12 @@ function setStatus(status) {
   return updateStatus({ status });
 }
 
-// ---------------------------------------------------------------------------
-// Candidate confirmation + snapshot pipeline
-// ---------------------------------------------------------------------------
-
 async function handleCandidate(address) {
   if (!address || trackedAddresses.has(address)) return;
 
   const marketData = await dexscreener.getTokenByAddress(address);
 
   if (!marketData || marketData.dataStatus === "unavailable" || !marketData.pairAddress) {
-    // No tradable pair confirmed yet — do not store as a discovered token.
     return;
   }
 
@@ -130,8 +90,6 @@ async function analyzeAndSnapshot(address) {
   const marketData = await dexscreener.getTokenByAddress(address);
 
   if (!marketData || marketData.dataStatus === "unavailable") {
-    // Provider error handling (spec section 33): keep previous snapshot,
-    // record an "unavailable" snapshot marker rather than fabricating data.
     await insertSnapshot({ address, dataStatus: "unavailable" });
     return;
   }
@@ -203,10 +161,6 @@ async function analyzeAndSnapshot(address) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Polling loop for already-tracked tokens
-// ---------------------------------------------------------------------------
-
 async function pollTrackedTokens() {
   for (const address of trackedAddresses) {
     try {
@@ -216,10 +170,6 @@ async function pollTrackedTokens() {
     }
   }
 }
-
-// ---------------------------------------------------------------------------
-// Fallback discovery (spec section 5) — only used while realtime is degraded
-// ---------------------------------------------------------------------------
 
 let fallbackTimer = null;
 
@@ -245,10 +195,6 @@ function stopFallbackPolling() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Bootstrap: resume tracking tokens already discovered in past runs
-// ---------------------------------------------------------------------------
-
 async function loadExistingTokens() {
   try {
     const tokens = await listRecentTokens(500);
@@ -261,11 +207,6 @@ async function loadExistingTokens() {
   }
 }
 
-// Wraps handleCandidate with a concurrency cap (see MAX_CONCURRENT_CANDIDATES
-// above) so a burst of noisy candidates can't open unbounded outbound
-// connections. Candidates arriving over the cap are dropped, not queued —
-// they're speculative addresses extracted from raw logs, so losing a few
-// under load is safe and expected.
 function tryHandleCandidate(address) {
   if (activeCandidateCount >= MAX_CONCURRENT_CANDIDATES) {
     return;
@@ -277,10 +218,6 @@ function tryHandleCandidate(address) {
       activeCandidateCount -= 1;
     });
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 async function main() {
   log("Solana AI scanner starting");
@@ -320,7 +257,6 @@ async function main() {
 
   stream.start();
 
-  // Periodically refresh snapshots for everything we're already tracking.
   setInterval(() => {
     pollTrackedTokens().catch((err) => log("poll loop error:", errMsg(err)));
   }, MARKET_POLL_INTERVAL_MS);
