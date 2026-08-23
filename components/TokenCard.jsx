@@ -22,7 +22,7 @@ export default function TokenCard({ token, rank }) {
         <div>Liq: {formatCompactUsd(token.liquidity)}</div>
         <div>Vol 5m: {formatCompactUsd(token.volume5m)}</div>
         <div>
-          B/S: {token.buys1m ?? "—"}/{token.sells1m ?? "—"}
+          B/S (5m): {token.buys5m ?? "—"}/{token.sells5m ?? "—"}
         </div>
         <div>Mom: {token.momentumScore ?? "—"}</div>
       </div>
