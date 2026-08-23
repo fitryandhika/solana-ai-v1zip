@@ -6,6 +6,12 @@
 import { NextResponse } from "next/server";
 import { getServiceClient } from "../../../lib/database/supabase";
 
+// Vercel/Next.js treats a route with no request-derived input as static and
+// caches its output at build time — so without this, scanner status would
+// permanently show whatever it was the moment of deployment, never live
+// data. This forces the route to run fresh on every request.
+export const dynamic = "force-dynamic";
+
 export async function GET() {
   try {
     const supabase = getServiceClient();
