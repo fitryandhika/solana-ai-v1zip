@@ -1,6 +1,6 @@
 {
   "name": "solana-ai",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "Realtime Solana new-token scanner and market-momentum ranking dashboard (V1 MVP).",
   "scripts": {
