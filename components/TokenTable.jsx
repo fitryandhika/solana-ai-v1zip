@@ -16,7 +16,7 @@ export default function TokenTable({ tokens }) {
             <th>Price</th>
             <th>Liquidity</th>
             <th>Volume 5m</th>
-            <th>Buy/Sell</th>
+            <th>Buy/Sell (5m)</th>
             <th>Momentum</th>
             <th>Score</th>
             <th>Signal</th>
@@ -37,7 +37,7 @@ export default function TokenTable({ tokens }) {
               <td>{formatCompactUsd(token.liquidity)}</td>
               <td>{formatCompactUsd(token.volume5m)}</td>
               <td>
-                {token.buys1m ?? "—"}/{token.sells1m ?? "—"}
+                {token.buys5m ?? "—"}/{token.sells5m ?? "—"}
               </td>
               <td className={momentumClass(token.momentumScore)}>{token.momentumScore ?? "—"}</td>
               <td>
