@@ -4,11 +4,12 @@
 import { NextResponse } from "next/server";
 import { getServiceClient } from "../../../lib/database/supabase";
 
+export const dynamic = "force-dynamic";
+
 export async function GET() {
   const result = { success: true, database: "unknown", dexscreener: "unknown", scanner: "unknown" };
   let overallOk = true;
 
-  // Database check
   try {
     const supabase = getServiceClient();
     const { error } = await supabase.from("scanner_status").select("id").limit(1);
@@ -19,7 +20,6 @@ export async function GET() {
     overallOk = false;
   }
 
-  // DexScreener check (lightweight — a known, stable Solana pair lookup)
   try {
     const base = process.env.DEXSCREENER_API_BASE_URL || "https://api.dexscreener.com";
     const res = await fetch(`${base}/latest/dex/search?q=SOL`, { headers: { Accept: "application/json" } });
@@ -30,7 +30,6 @@ export async function GET() {
     overallOk = false;
   }
 
-  // Scanner check — is scanner_status fresh (updated within the last 5 minutes)?
   try {
     const supabase = getServiceClient();
     const { data } = await supabase
