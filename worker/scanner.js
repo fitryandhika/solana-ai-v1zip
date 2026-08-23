@@ -5,6 +5,18 @@
 // somewhere that supports a long-lived process (a small VM, Railway, Fly.io,
 // a Render background worker, etc). It writes to the SAME Supabase project
 // as the Next.js app, which only ever reads from Supabase.
+//
+// Flow per spec section 30:
+//   1. Connect to Solana WebSocket.
+//   2. Listen for relevant events.
+//   3. Identify candidate token/pair activity.
+//   4. Query DexScreener.
+//   5. Confirm tradable pair.
+//   6. Insert token if new.
+//   7. Start collecting snapshots.
+//   8. Calculate score.
+//   9. Store snapshot.
+//   10. Continue monitoring.
 
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
 require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
@@ -17,18 +29,48 @@ const { getServiceClient } = require("../lib/database/supabase");
 const { calculateVolumeRatio, calculateMomentumScore, calculateBuyPressureScore } = require("../lib/analyzer/momentum");
 const { calculateOpportunityScore, classifySignal } = require("../lib/analyzer/opportunity");
 const { computeTokenAgeMinutes } = require("../lib/utils/format");
+const { runDiscoveryChecks } = require("../lib/solana/rug-check");
 
 const MARKET_POLL_INTERVAL_MS = Number(process.env.MARKET_POLL_INTERVAL_MS || 10000);
 const RECONNECT_DELAY_MS = Number(process.env.SCANNER_RECONNECT_DELAY_MS || 5000);
-const FALLBACK_POLL_INTERVAL_MS = 60000;
+const FALLBACK_POLL_INTERVAL_MS = 60000; // conservative, per spec section 5
 
+// Raw Solana program logs are noisy — the candidate-address heuristic in
+// lib/solana/websocket.js can match many non-token substrings per log line.
+// Without a cap, a burst of candidates each opens an outbound DexScreener
+// request, which can exhaust the container's ephemeral ports and get the
+// process killed. Capping concurrent candidate handling (and simply
+// dropping candidates over the cap — they're speculative anyway) keeps
+// outbound connections bounded regardless of how bursty the chain gets.
 const MAX_CONCURRENT_CANDIDATES = Number(process.env.MAX_CONCURRENT_CANDIDATES || 3);
 let activeCandidateCount = 0;
 
+// last_event_at fires on every single program-log event, which on a busy
+// Solana program can be hundreds per second. Writing to Supabase that often
+// floods the database and the process's own connection pool. Throttle it to
+// at most once every few seconds — it only feeds a "last scan" display, so
+// sub-second freshness isn't needed.
 const EVENT_STATUS_THROTTLE_MS = 5000;
 let lastEventStatusUpdate = 0;
 
 const trackedAddresses = new Set();
+
+// Tracks when we first started tracking each token and when it last got a
+// snapshot written — used to throttle snapshot frequency for older tokens
+// (see SPARSE_SNAPSHOT_INTERVAL_MS below), so months of continuous scanning
+// doesn't silently blow past Supabase's storage limit.
+const trackedSince = new Map();
+const lastSnapshotAt = new Map();
+
+// Snapshots stay at full MARKET_POLL_INTERVAL_MS frequency for a token's
+// first 24h — that's the window where momentum/signal evaluation matters
+// most. After that, drop to one snapshot every few minutes; the token is
+// still tracked forever, just not at full density once its early window
+// has passed. This keeps storage growth bounded without ever deleting
+// history.
+const DENSE_SNAPSHOT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const SPARSE_SNAPSHOT_INTERVAL_MS = Number(process.env.SPARSE_SNAPSHOT_INTERVAL_MS || 5 * 60 * 1000);
+
 let tokensDiscoveredCount = 0;
 let tokensAnalyzedCount = 0;
 
@@ -36,11 +78,22 @@ function log(...args) {
   console.log(`[scanner ${new Date().toISOString()}]`, ...args);
 }
 
+// Rejections aren't always Error instances (a caught non-Error throw, or a
+// rejection value that's undefined), so never assume err.message exists.
 function errMsg(err) {
   if (!err) return "unknown error";
   return err.message || String(err);
 }
 
+// ---------------------------------------------------------------------------
+// scanner_status helpers
+// ---------------------------------------------------------------------------
+
+// scanner_status is meant to hold exactly one row. Using a fixed, known id
+// with upsert (instead of "select the existing row, then insert or update")
+// makes that a real guarantee enforced by the database's primary key,
+// rather than a race between whatever processes happen to call this at the
+// same time — which is what created duplicate rows before.
 const SCANNER_STATUS_ROW_ID = "00000000-0000-0000-0000-000000000001";
 
 async function updateStatus(patch) {
@@ -59,21 +112,48 @@ function setStatus(status) {
   return updateStatus({ status });
 }
 
-async function handleCandidate(address) {
+// ---------------------------------------------------------------------------
+// Candidate confirmation + snapshot pipeline
+// ---------------------------------------------------------------------------
+
+async function handleCandidate(address, meta = {}) {
   if (!address || trackedAddresses.has(address)) return;
 
   const marketData = await dexscreener.getTokenByAddress(address);
 
   if (!marketData || marketData.dataStatus === "unavailable" || !marketData.pairAddress) {
+    // No tradable pair confirmed yet — do not store as a discovered token.
     return;
   }
 
   trackedAddresses.add(address);
+  const discoveredAt = Date.now();
+  trackedSince.set(address, discoveredAt);
+
+  // One-time rug-risk checks (mint/freeze authority, holder concentration).
+  // Best-effort — a failure here shouldn't block storing the token itself,
+  // since that would mean losing a real discovery over a diagnostic check.
+  let rugCheck = { mintAuthorityRevoked: null, freezeAuthorityRevoked: null, rugCheckError: "not checked", top10HolderPct: null };
+  try {
+    rugCheck = await runDiscoveryChecks(address);
+  } catch (err) {
+    rugCheck.rugCheckError = errMsg(err);
+  }
 
   try {
-    await upsertToken(marketData);
+    await upsertToken({
+      ...marketData,
+      creator: meta.creator || marketData.creator || null,
+      source: meta.source || "trending",
+      ageAtDiscoveryMinutes: computeTokenAgeMinutes(marketData.pairCreatedAt),
+      mintAuthorityRevoked: rugCheck.mintAuthorityRevoked,
+      freezeAuthorityRevoked: rugCheck.freezeAuthorityRevoked,
+      rugCheckAt: new Date().toISOString(),
+      rugCheckError: rugCheck.rugCheckError,
+      top10HolderPct: rugCheck.top10HolderPct
+    });
     tokensDiscoveredCount += 1;
-    log("discovered token", marketData.symbol || address, address);
+    log("discovered token", marketData.symbol || address, address, `source=${meta.source || "trending"}`);
     await updateStatus({
       last_token_discovered_at: new Date().toISOString(),
       tokens_discovered: tokensDiscoveredCount
@@ -86,11 +166,13 @@ async function handleCandidate(address) {
   await analyzeAndSnapshot(address);
 }
 
-async function analyzeAndSnapshot(address) {
+async function analyzeAndSnapshot(address, solPriceUsd = null) {
   const marketData = await dexscreener.getTokenByAddress(address);
 
   if (!marketData || marketData.dataStatus === "unavailable") {
-    await insertSnapshot({ address, dataStatus: "unavailable" });
+    // Provider error handling (spec section 33): keep previous snapshot,
+    // record an "unavailable" snapshot marker rather than fabricating data.
+    await insertSnapshot({ address, dataStatus: "unavailable", solPriceUsd });
     return;
   }
 
@@ -151,7 +233,8 @@ async function analyzeAndSnapshot(address) {
     momentumScore,
     opportunityScore,
     signal,
-    dataStatus: "ok"
+    dataStatus: "ok",
+    solPriceUsd
   });
 
   tokensAnalyzedCount += 1;
@@ -161,15 +244,36 @@ async function analyzeAndSnapshot(address) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Polling loop for already-tracked tokens
+// ---------------------------------------------------------------------------
+
 async function pollTrackedTokens() {
+  const now = Date.now();
+  const solPriceUsd = await dexscreener.getSolPriceUsd().catch(() => null);
+
   for (const address of trackedAddresses) {
+    const since = trackedSince.get(address) || now;
+    const isDense = now - since < DENSE_SNAPSHOT_WINDOW_MS;
+    const requiredIntervalMs = isDense ? 0 : SPARSE_SNAPSHOT_INTERVAL_MS;
+    const last = lastSnapshotAt.get(address) || 0;
+
+    if (!isDense && now - last < requiredIntervalMs) {
+      continue; // Older token, not due for its next (sparser) snapshot yet.
+    }
+
     try {
-      await analyzeAndSnapshot(address);
+      await analyzeAndSnapshot(address, solPriceUsd);
+      lastSnapshotAt.set(address, now);
     } catch (err) {
       log("snapshot failed for", address, errMsg(err));
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Fallback discovery (spec section 5) — only used while realtime is degraded
+// ---------------------------------------------------------------------------
 
 let fallbackTimer = null;
 
@@ -180,7 +284,7 @@ function startFallbackPolling() {
     try {
       const addresses = await dexscreener.pollRecentSolanaPairs();
       for (const address of addresses) {
-        await handleCandidate(address);
+        await handleCandidate(address, { source: "trending" });
       }
     } catch (err) {
       log("fallback polling error:", errMsg(err));
@@ -195,10 +299,18 @@ function stopFallbackPolling() {
   }
 }
 
+// ---------------------------------------------------------------------------
 // Trending discovery — finds tokens that are ALREADY established but showing
-// renewed activity, not just brand-new ones. Runs continuously alongside the
-// realtime stream, feeding the same confirm → track → score pipeline.
-const TRENDING_POLL_INTERVAL_MS = Number(process.env.TRENDING_POLL_INTERVAL_MS || 300000);
+// renewed activity, not just brand-new ones. The blockchain WebSocket stream
+// above only ever sees a token at the moment its pool is first created, so
+// on its own it can never surface "this 3-day-old token just started picking
+// up volume again." This runs continuously (not just when the realtime
+// stream is degraded) alongside it, feeding the same confirm → track →
+// score pipeline. The scoring itself already supports this — classifySignal
+// has a MOMENTUM category specifically for non-new tokens with strong
+// renewed volume/price movement (see lib/analyzer/opportunity.js) — the gap
+// was purely that we never looked at anything but freshly created tokens.
+const TRENDING_POLL_INTERVAL_MS = Number(process.env.TRENDING_POLL_INTERVAL_MS || 300000); // 5 min default
 let trendingTimer = null;
 
 function startTrendingPolling() {
@@ -208,7 +320,7 @@ function startTrendingPolling() {
     try {
       const addresses = await dexscreener.pollRecentSolanaPairs();
       for (const address of addresses) {
-        await handleCandidate(address);
+        await handleCandidate(address, { source: "trending" });
       }
     } catch (err) {
       log("trending polling error:", errMsg(err));
@@ -223,11 +335,17 @@ function stopTrendingPolling() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Bootstrap: resume tracking tokens already discovered in past runs
+// ---------------------------------------------------------------------------
+
 async function loadExistingTokens() {
   try {
     const tokens = await listRecentTokens(500);
     for (const token of tokens) {
       trackedAddresses.add(token.address);
+      const firstSeenMs = token.first_seen_at ? new Date(token.first_seen_at).getTime() : Date.now();
+      trackedSince.set(token.address, firstSeenMs);
     }
     log(`resumed tracking ${trackedAddresses.size} existing tokens`);
   } catch (err) {
@@ -235,17 +353,26 @@ async function loadExistingTokens() {
   }
 }
 
-function tryHandleCandidate(address) {
+// Wraps handleCandidate with a concurrency cap (see MAX_CONCURRENT_CANDIDATES
+// above) so a burst of noisy candidates can't open unbounded outbound
+// connections. Candidates arriving over the cap are dropped, not queued —
+// they're speculative addresses extracted from raw logs, so losing a few
+// under load is safe and expected.
+function tryHandleCandidate(address, meta) {
   if (activeCandidateCount >= MAX_CONCURRENT_CANDIDATES) {
     return;
   }
   activeCandidateCount += 1;
-  handleCandidate(address)
+  handleCandidate(address, meta)
     .catch((err) => log("candidate handling error:", errMsg(err)))
     .finally(() => {
       activeCandidateCount -= 1;
     });
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 async function main() {
   log("Solana AI scanner starting");
@@ -267,10 +394,14 @@ async function main() {
     updateStatus({ last_event_at: new Date().toISOString() });
   });
 
-  stream.on("candidate", ({ address }) => {
-    tryHandleCandidate(address);
+  stream.on("candidate", ({ address, creator, source }) => {
+    tryHandleCandidate(address, { creator, source: source || "blockchain" });
   });
 
+  // Temporary diagnostic visibility into the discovery pipeline — shows
+  // whether transaction lookups are succeeding and how many candidate
+  // addresses each one yields, so "zero tokens discovered" can be traced to
+  // a specific stage instead of failing silently.
   stream.on("debug", (message) => {
     log("debug:", message);
   });
@@ -289,8 +420,12 @@ async function main() {
 
   stream.start();
 
+  // Trending-token discovery runs continuously alongside the realtime
+  // stream — it's not a fallback, it's a second, independent discovery
+  // source for tokens that already exist but are showing renewed activity.
   startTrendingPolling();
 
+  // Periodically refresh snapshots for everything we're already tracking.
   setInterval(() => {
     pollTrackedTokens().catch((err) => log("poll loop error:", errMsg(err)));
   }, MARKET_POLL_INTERVAL_MS);
