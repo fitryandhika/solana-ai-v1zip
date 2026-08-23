@@ -18,12 +18,8 @@
 //   9. Store snapshot.
 //   10. Continue monitoring.
 
-try {
-  require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
-  require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
-} catch (err) {
-  // dotenv not available on this platform — Railway injects env vars natively, so this is fine.
-}
+require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
+require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
 
 const { SolanaDiscoveryStream } = require("../lib/solana/websocket");
 const dexscreener = require("../lib/providers/dexscreener");
@@ -38,12 +34,37 @@ const MARKET_POLL_INTERVAL_MS = Number(process.env.MARKET_POLL_INTERVAL_MS || 10
 const RECONNECT_DELAY_MS = Number(process.env.SCANNER_RECONNECT_DELAY_MS || 5000);
 const FALLBACK_POLL_INTERVAL_MS = 60000; // conservative, per spec section 5
 
+// Raw Solana program logs are noisy — the candidate-address heuristic in
+// lib/solana/websocket.js can match many non-token substrings per log line.
+// Without a cap, a burst of candidates each opens an outbound DexScreener
+// request, which can exhaust the container's ephemeral ports and get the
+// process killed. Capping concurrent candidate handling (and simply
+// dropping candidates over the cap — they're speculative anyway) keeps
+// outbound connections bounded regardless of how bursty the chain gets.
+const MAX_CONCURRENT_CANDIDATES = Number(process.env.MAX_CONCURRENT_CANDIDATES || 3);
+let activeCandidateCount = 0;
+
+// last_event_at fires on every single program-log event, which on a busy
+// Solana program can be hundreds per second. Writing to Supabase that often
+// floods the database and the process's own connection pool. Throttle it to
+// at most once every few seconds — it only feeds a "last scan" display, so
+// sub-second freshness isn't needed.
+const EVENT_STATUS_THROTTLE_MS = 5000;
+let lastEventStatusUpdate = 0;
+
 const trackedAddresses = new Set();
 let tokensDiscoveredCount = 0;
 let tokensAnalyzedCount = 0;
 
 function log(...args) {
   console.log(`[scanner ${new Date().toISOString()}]`, ...args);
+}
+
+// Rejections aren't always Error instances (a caught non-Error throw, or a
+// rejection value that's undefined), so never assume err.message exists.
+function errMsg(err) {
+  if (!err) return "unknown error";
+  return err.message || String(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +82,7 @@ async function updateStatus(patch) {
       await supabase.from("scanner_status").insert(patch);
     }
   } catch (err) {
-    log("failed to update scanner_status:", err.message);
+    log("failed to update scanner_status:", errMsg(err));
   }
 }
 
@@ -94,7 +115,7 @@ async function handleCandidate(address) {
       tokens_discovered: tokensDiscoveredCount
     });
   } catch (err) {
-    log("failed to store token", address, err.message);
+    log("failed to store token", address, errMsg(err));
     return;
   }
 
@@ -115,7 +136,7 @@ async function analyzeAndSnapshot(address) {
   try {
     baseline = await getBaselineSnapshot(address, 5);
   } catch (err) {
-    log("baseline lookup failed", address, err.message);
+    log("baseline lookup failed", address, errMsg(err));
   }
 
   const volumeRatio = baseline ? calculateVolumeRatio(marketData.volume5m, baseline.volume_5m) : null;
@@ -187,7 +208,7 @@ async function pollTrackedTokens() {
     try {
       await analyzeAndSnapshot(address);
     } catch (err) {
-      log("snapshot failed for", address, err.message);
+      log("snapshot failed for", address, errMsg(err));
     }
   }
 }
@@ -208,7 +229,7 @@ function startFallbackPolling() {
         await handleCandidate(address);
       }
     } catch (err) {
-      log("fallback polling error:", err.message);
+      log("fallback polling error:", errMsg(err));
     }
   }, FALLBACK_POLL_INTERVAL_MS);
 }
@@ -232,8 +253,25 @@ async function loadExistingTokens() {
     }
     log(`resumed tracking ${trackedAddresses.size} existing tokens`);
   } catch (err) {
-    log("failed to load existing tokens:", err.message);
+    log("failed to load existing tokens:", errMsg(err));
   }
+}
+
+// Wraps handleCandidate with a concurrency cap (see MAX_CONCURRENT_CANDIDATES
+// above) so a burst of noisy candidates can't open unbounded outbound
+// connections. Candidates arriving over the cap are dropped, not queued —
+// they're speculative addresses extracted from raw logs, so losing a few
+// under load is safe and expected.
+function tryHandleCandidate(address) {
+  if (activeCandidateCount >= MAX_CONCURRENT_CANDIDATES) {
+    return;
+  }
+  activeCandidateCount += 1;
+  handleCandidate(address)
+    .catch((err) => log("candidate handling error:", errMsg(err)))
+    .finally(() => {
+      activeCandidateCount -= 1;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -254,11 +292,14 @@ async function main() {
   });
 
   stream.on("event", () => {
+    const now = Date.now();
+    if (now - lastEventStatusUpdate < EVENT_STATUS_THROTTLE_MS) return;
+    lastEventStatusUpdate = now;
     updateStatus({ last_event_at: new Date().toISOString() });
   });
 
   stream.on("candidate", ({ address }) => {
-    handleCandidate(address).catch((err) => log("candidate handling error:", err.message));
+    tryHandleCandidate(address);
   });
 
   stream.on("reconnecting", ({ delay, attempt }) => {
@@ -268,8 +309,8 @@ async function main() {
   });
 
   stream.on("error", (err) => {
-    log("WebSocket error:", err.message);
-    updateStatus({ last_error: err.message, status: "DEGRADED" });
+    log("WebSocket error:", errMsg(err));
+    updateStatus({ last_error: errMsg(err), status: "DEGRADED" });
     startFallbackPolling();
   });
 
@@ -277,7 +318,7 @@ async function main() {
 
   // Periodically refresh snapshots for everything we're already tracking.
   setInterval(() => {
-    pollTrackedTokens().catch((err) => log("poll loop error:", err.message));
+    pollTrackedTokens().catch((err) => log("poll loop error:", errMsg(err)));
   }, MARKET_POLL_INTERVAL_MS);
 
   process.on("SIGINT", () => {
