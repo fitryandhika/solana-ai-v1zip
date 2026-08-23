@@ -108,9 +108,9 @@ export default function TokenDetail({ address }) {
           <div className="stat-value">{formatCompactUsd(latestSnapshot?.volume_5m)}</div>
         </div>
         <div className="stat">
-          <div className="stat-label">Buys / Sells</div>
+          <div className="stat-label">Buys / Sells (5m)</div>
           <div className="stat-value">
-            {latestSnapshot?.buys_1m ?? "—"} / {latestSnapshot?.sells_1m ?? "—"}
+            {latestSnapshot?.buys_5m ?? "—"} / {latestSnapshot?.sells_5m ?? "—"}
           </div>
         </div>
         <div className="stat">
