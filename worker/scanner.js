@@ -23,7 +23,7 @@ require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env"
 
 const { SolanaDiscoveryStream } = require("../lib/solana/websocket");
 const dexscreener = require("../lib/providers/dexscreener");
-const { upsertToken, listRecentTokens } = require("../lib/database/tokens");
+const { upsertToken, listRecentTokens, getCreatorHistory } = require("../lib/database/tokens");
 const { insertSnapshot, getBaselineSnapshot, getSnapshotAtOrAfter, getFirstSnapshot } = require("../lib/database/snapshots");
 const { getServiceClient } = require("../lib/database/supabase");
 const { calculateVolumeRatio, calculateMomentumScore, calculateBuyPressureScore } = require("../lib/analyzer/momentum");
@@ -156,17 +156,34 @@ async function handleCandidate(address, meta = {}) {
     rugCheck.rugCheckError = errMsg(err);
   }
 
+  const creator = meta.creator || marketData.creator || null;
+
+  // Creator history is computed from our OWN data (see
+  // migration_005_creator_history.sql) — no extra external calls. Best-
+  // effort: a failure here shouldn't block storing the token itself.
+  let creatorHistory = { priorTokenCount: null, priorRugCount: null, priorAvgPriceChangePct24h: null };
+  if (creator) {
+    try {
+      creatorHistory = await getCreatorHistory(creator, address);
+    } catch (err) {
+      log("creator history lookup failed for", creator, errMsg(err));
+    }
+  }
+
   try {
     await upsertToken({
       ...marketData,
-      creator: meta.creator || marketData.creator || null,
+      creator,
       source: meta.source || "trending",
       ageAtDiscoveryMinutes: computeTokenAgeMinutes(marketData.pairCreatedAt),
       mintAuthorityRevoked: rugCheck.mintAuthorityRevoked,
       freezeAuthorityRevoked: rugCheck.freezeAuthorityRevoked,
       rugCheckAt: new Date().toISOString(),
       rugCheckError: rugCheck.rugCheckError,
-      top10HolderPct: rugCheck.top10HolderPct
+      top10HolderPct: rugCheck.top10HolderPct,
+      creatorPriorTokenCount: creatorHistory.priorTokenCount,
+      creatorPriorRugCount: creatorHistory.priorRugCount,
+      creatorPriorAvgPriceChangePct24h: creatorHistory.priorAvgPriceChangePct24h
     });
     tokensDiscoveredCount += 1;
     log("discovered token", marketData.symbol || address, address, `source=${meta.source || "trending"}`);
