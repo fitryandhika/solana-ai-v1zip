@@ -24,12 +24,14 @@ require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env"
 const { SolanaDiscoveryStream } = require("../lib/solana/websocket");
 const dexscreener = require("../lib/providers/dexscreener");
 const { upsertToken, listRecentTokens } = require("../lib/database/tokens");
-const { insertSnapshot, getBaselineSnapshot } = require("../lib/database/snapshots");
+const { insertSnapshot, getBaselineSnapshot, getSnapshotAtOrAfter, getFirstSnapshot } = require("../lib/database/snapshots");
 const { getServiceClient } = require("../lib/database/supabase");
 const { calculateVolumeRatio, calculateMomentumScore, calculateBuyPressureScore } = require("../lib/analyzer/momentum");
 const { calculateOpportunityScore, classifySignal } = require("../lib/analyzer/opportunity");
 const { computeTokenAgeMinutes } = require("../lib/utils/format");
 const { runDiscoveryChecks } = require("../lib/solana/rug-check");
+const { insertInitialOutcome, updateOutcome, getFinalizedAddresses, getInProgressOutcomes } = require("../lib/database/outcomes");
+const { HORIZONS, getDueHorizons, buildHorizonPatch } = require("../lib/analyzer/outcomes");
 
 const MARKET_POLL_INTERVAL_MS = Number(process.env.MARKET_POLL_INTERVAL_MS || 10000);
 const RECONNECT_DELAY_MS = Number(process.env.SCANNER_RECONNECT_DELAY_MS || 5000);
@@ -70,6 +72,20 @@ const lastSnapshotAt = new Map();
 // history.
 const DENSE_SNAPSHOT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const SPARSE_SNAPSHOT_INTERVAL_MS = Number(process.env.SPARSE_SNAPSHOT_INTERVAL_MS || 5 * 60 * 1000);
+
+// Discovery-time price/liquidity for each token, needed to compute
+// price_change_pct_<horizon> without an extra DB read on every outcome
+// check. Populated once, at discovery, in handleCandidate.
+const discoverySnapshotByAddress = new Map();
+
+// Which outcome horizons have already been computed for each token, and
+// which tokens are fully finalized (24h horizon done — never need checking
+// again). Both populated from the DB at startup so a restart doesn't
+// re-walk months of already-finalized tokens.
+const computedHorizonsByAddress = new Map();
+const finalizedAddresses = new Set();
+
+const OUTCOME_CHECK_INTERVAL_MS = Number(process.env.OUTCOME_CHECK_INTERVAL_MS || 60000);
 
 let tokensDiscoveredCount = 0;
 let tokensAnalyzedCount = 0;
@@ -163,7 +179,29 @@ async function handleCandidate(address, meta = {}) {
     return;
   }
 
-  await analyzeAndSnapshot(address);
+  await analyzeAndSnapshot(address).then(async (initialSnapshot) => {
+    if (!initialSnapshot) return; // Confirmed as a token but no market data yet — outcome tracking starts once we have a real price to compare against.
+
+    discoverySnapshotByAddress.set(address, {
+      price: initialSnapshot.price,
+      liquidity: initialSnapshot.liquidity
+    });
+    computedHorizonsByAddress.set(address, new Set());
+
+    try {
+      await insertInitialOutcome({
+        address,
+        discoveredAt: new Date(discoveredAt).toISOString(),
+        discoveryPrice: initialSnapshot.price,
+        discoveryLiquidity: initialSnapshot.liquidity,
+        discoveryMarketCap: initialSnapshot.marketCap,
+        discoveryOpportunityScore: initialSnapshot.opportunityScore,
+        discoverySignal: initialSnapshot.signal
+      });
+    } catch (err) {
+      log("failed to create initial outcome row for", address, errMsg(err));
+    }
+  });
 }
 
 async function analyzeAndSnapshot(address, solPriceUsd = null) {
@@ -173,7 +211,7 @@ async function analyzeAndSnapshot(address, solPriceUsd = null) {
     // Provider error handling (spec section 33): keep previous snapshot,
     // record an "unavailable" snapshot marker rather than fabricating data.
     await insertSnapshot({ address, dataStatus: "unavailable", solPriceUsd });
-    return;
+    return null;
   }
 
   let baseline = null;
@@ -242,6 +280,14 @@ async function analyzeAndSnapshot(address, solPriceUsd = null) {
     last_successful_api_call: new Date().toISOString(),
     tokens_analyzed: tokensAnalyzedCount
   });
+
+  return {
+    price: marketData.price,
+    liquidity: marketData.liquidity,
+    marketCap: marketData.marketCap,
+    opportunityScore,
+    signal
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +313,54 @@ async function pollTrackedTokens() {
       lastSnapshotAt.set(address, now);
     } catch (err) {
       log("snapshot failed for", address, errMsg(err));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Outcome tracking — computes price_change_pct_<horizon> for every token
+// once each horizon (1m, 5m, 15m, 30m, 1h, 4h, 24h since discovery) is
+// reached. This is what turns raw snapshots into a ready-to-query
+// evaluation dataset (see database/migration_004_outcomes.sql).
+// ---------------------------------------------------------------------------
+
+async function checkOutcomesDue() {
+  const now = Date.now();
+
+  for (const address of trackedAddresses) {
+    if (finalizedAddresses.has(address)) continue;
+
+    const discoveredAt = trackedSince.get(address);
+    const discovery = discoverySnapshotByAddress.get(address);
+    if (!discoveredAt || !discovery) continue; // Not yet confirmed with real market data.
+
+    const alreadyComputed = computedHorizonsByAddress.get(address) || new Set();
+    const due = getDueHorizons(discoveredAt, now, alreadyComputed);
+    if (due.length === 0) continue;
+
+    for (const horizon of due) {
+      try {
+        const targetTimestamp = new Date(discoveredAt + horizon.ms).toISOString();
+        const outcomeSnapshot = await getSnapshotAtOrAfter(address, targetTimestamp);
+        const patch = buildHorizonPatch(horizon.label, discovery, outcomeSnapshot);
+
+        if (!patch) continue; // No snapshot reached that far yet — try again next cycle.
+
+        await updateOutcome(address, patch);
+        alreadyComputed.add(horizon.label);
+        computedHorizonsByAddress.set(address, alreadyComputed);
+
+        if (horizon.label === "24h") {
+          await updateOutcome(address, { finalized_at: new Date().toISOString() });
+          finalizedAddresses.add(address);
+          // Free the in-memory caches for a finalized token — they're only
+          // needed while outcome computation is still in progress.
+          discoverySnapshotByAddress.delete(address);
+          computedHorizonsByAddress.delete(address);
+        }
+      } catch (err) {
+        log("outcome check failed for", address, horizon.label, errMsg(err));
+      }
     }
   }
 }
@@ -351,6 +445,64 @@ async function loadExistingTokens() {
   } catch (err) {
     log("failed to load existing tokens:", errMsg(err));
   }
+
+  try {
+    const finalized = await getFinalizedAddresses();
+    for (const address of finalized) {
+      finalizedAddresses.add(address);
+    }
+    log(`${finalizedAddresses.size} tokens already have finalized outcomes`);
+  } catch (err) {
+    log("failed to load finalized outcome addresses:", errMsg(err));
+  }
+
+  try {
+    const inProgressAddresses = Array.from(trackedAddresses).filter((a) => !finalizedAddresses.has(a));
+    const inProgress = await getInProgressOutcomes(inProgressAddresses);
+    for (const row of inProgress) {
+      discoverySnapshotByAddress.set(row.token_address, {
+        price: row.discovery_price,
+        liquidity: row.discovery_liquidity
+      });
+      const computed = new Set(HORIZONS.filter((h) => row[`price_change_pct_${h.label}`] !== null).map((h) => h.label));
+      computedHorizonsByAddress.set(row.token_address, computed);
+    }
+    log(`resumed outcome tracking for ${inProgress.length} in-progress tokens`);
+  } catch (err) {
+    log("failed to resume in-progress outcome tracking:", errMsg(err));
+  }
+
+  // Backfill: tokens discovered before outcome tracking existed have no
+  // token_outcomes row yet. Use their earliest snapshot as the discovery
+  // baseline so they still end up in the evaluation dataset going forward,
+  // instead of being silently excluded forever.
+  const missingOutcome = Array.from(trackedAddresses).filter(
+    (a) => !finalizedAddresses.has(a) && !discoverySnapshotByAddress.has(a)
+  );
+  for (const address of missingOutcome) {
+    try {
+      const firstSnapshot = await getFirstSnapshot(address);
+      if (!firstSnapshot || firstSnapshot.data_status !== "ok") continue;
+
+      const discoveredAt = trackedSince.get(address) || Date.now();
+      await insertInitialOutcome({
+        address,
+        discoveredAt: new Date(discoveredAt).toISOString(),
+        discoveryPrice: firstSnapshot.price,
+        discoveryLiquidity: firstSnapshot.liquidity,
+        discoveryMarketCap: firstSnapshot.market_cap,
+        discoveryOpportunityScore: firstSnapshot.opportunity_score,
+        discoverySignal: firstSnapshot.signal
+      });
+      discoverySnapshotByAddress.set(address, { price: firstSnapshot.price, liquidity: firstSnapshot.liquidity });
+      computedHorizonsByAddress.set(address, new Set());
+    } catch (err) {
+      log("failed to backfill outcome baseline for", address, errMsg(err));
+    }
+  }
+  if (missingOutcome.length > 0) {
+    log(`backfilled outcome baseline for ${missingOutcome.length} pre-existing tokens`);
+  }
 }
 
 // Wraps handleCandidate with a concurrency cap (see MAX_CONCURRENT_CANDIDATES
@@ -429,6 +581,13 @@ async function main() {
   setInterval(() => {
     pollTrackedTokens().catch((err) => log("poll loop error:", errMsg(err)));
   }, MARKET_POLL_INTERVAL_MS);
+
+  // Periodically compute due outcome horizons (1m/5m/15m/30m/1h/4h/24h).
+  // Runs on its own, coarser interval — horizons don't need checking as
+  // often as snapshots do.
+  setInterval(() => {
+    checkOutcomesDue().catch((err) => log("outcome check loop error:", errMsg(err)));
+  }, OUTCOME_CHECK_INTERVAL_MS);
 
   process.on("SIGINT", () => {
     log("shutting down");
