@@ -18,8 +18,12 @@
 //   9. Store snapshot.
 //   10. Continue monitoring.
 
-require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
-require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
+try {
+  require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env.local") });
+  require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
+} catch (err) {
+  // dotenv not available on this platform — Railway injects env vars natively, so this is fine.
+}
 
 const { SolanaDiscoveryStream } = require("../lib/solana/websocket");
 const dexscreener = require("../lib/providers/dexscreener");
