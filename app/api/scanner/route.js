@@ -12,14 +12,19 @@ import { getServiceClient } from "../../../lib/database/supabase";
 // data. This forces the route to run fresh on every request.
 export const dynamic = "force-dynamic";
 
+// Must match SCANNER_STATUS_ROW_ID in worker/scanner.js — scanner_status is
+// a singleton table, and querying this exact row (rather than "whichever
+// row was updated most recently") means a stray leftover row from before
+// the singleton fix can never cause this endpoint to return stale data.
+const SCANNER_STATUS_ROW_ID = "00000000-0000-0000-0000-000000000001";
+
 export async function GET() {
   try {
     const supabase = getServiceClient();
     const { data, error } = await supabase
       .from("scanner_status")
       .select("*")
-      .order("updated_at", { ascending: false })
-      .limit(1)
+      .eq("id", SCANNER_STATUS_ROW_ID)
       .maybeSingle();
 
     if (error) throw error;
