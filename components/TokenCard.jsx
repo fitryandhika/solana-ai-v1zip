@@ -3,16 +3,20 @@
 import Link from "next/link";
 import { formatCompactUsd, formatPrice, formatTokenAge } from "../lib/utils/format";
 import { ScoreBadge, SignalBadge } from "./ScoreBadge";
+import { TokenLogo } from "./TokenLogo";
 
 export default function TokenCard({ token, rank }) {
   return (
     <Link href={`/token/${token.address}`} className="card token-card">
       <div className="token-card-top">
-        <div>
-          <strong>
-            #{rank} {token.symbol || "?"}
-          </strong>
-          <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{token.name || "Unknown"}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <TokenLogo imageUrl={token.imageUrl} symbol={token.symbol} size={32} />
+          <div>
+            <strong>
+              #{rank} {token.symbol || "?"}
+            </strong>
+            <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{token.name || "Unknown"}</div>
+          </div>
         </div>
         <ScoreBadge score={token.opportunityScore} />
       </div>
