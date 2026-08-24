@@ -32,6 +32,16 @@ const { computeTokenAgeMinutes } = require("../lib/utils/format");
 const { runDiscoveryChecks } = require("../lib/solana/rug-check");
 const { insertInitialOutcome, updateOutcome, getFinalizedAddresses, getInProgressOutcomes } = require("../lib/database/outcomes");
 const { HORIZONS, getDueHorizons, buildHorizonPatch } = require("../lib/analyzer/outcomes");
+const { scanForWhaleTrades } = require("../lib/solana/whale-transactions");
+const {
+  insertWalletTrade,
+  getTokenWhaleScanCursor,
+  setTokenWhaleScanCursor,
+  getWalletsToScore,
+  getEarlyBuysWithOutcomes,
+  updateWalletScore
+} = require("../lib/database/whales");
+const { computeWalletScore } = require("../lib/analyzer/whale-stats");
 
 const MARKET_POLL_INTERVAL_MS = Number(process.env.MARKET_POLL_INTERVAL_MS || 10000);
 const RECONNECT_DELAY_MS = Number(process.env.SCANNER_RECONNECT_DELAY_MS || 5000);
@@ -86,6 +96,17 @@ const computedHorizonsByAddress = new Map();
 const finalizedAddresses = new Set();
 
 const OUTCOME_CHECK_INTERVAL_MS = Number(process.env.OUTCOME_CHECK_INTERVAL_MS || 60000);
+
+// Whale tracking — pair address cache (needed to scan for swap
+// transactions), plus config for how much of each cycle's RPC budget this
+// feature is allowed to use. Deliberately conservative: this shares the
+// same 10 req/sec Helius budget as blockchain discovery and rug-checks,
+// which matter more for the core product.
+const pairAddressByAddress = new Map();
+const WHALE_SCAN_INTERVAL_MS = Number(process.env.WHALE_SCAN_INTERVAL_MS || 120000);
+const WHALE_SCAN_BATCH_SIZE = Number(process.env.WHALE_SCAN_BATCH_SIZE || 5);
+const WHALE_EARLY_BUY_WINDOW_MS = Number(process.env.WHALE_EARLY_BUY_WINDOW_MS || 2 * 60 * 60 * 1000); // 2h
+const WALLET_RESCORE_INTERVAL_MS = Number(process.env.WALLET_RESCORE_INTERVAL_MS || 30 * 60 * 1000); // 30 min
 
 let tokensDiscoveredCount = 0;
 let tokensAnalyzedCount = 0;
@@ -145,6 +166,7 @@ async function handleCandidate(address, meta = {}) {
   trackedAddresses.add(address);
   const discoveredAt = Date.now();
   trackedSince.set(address, discoveredAt);
+  pairAddressByAddress.set(address, marketData.pairAddress);
 
   // One-time rug-risk checks (mint/freeze authority, holder concentration).
   // Best-effort — a failure here shouldn't block storing the token itself,
@@ -383,6 +405,72 @@ async function checkOutcomesDue() {
 }
 
 // ---------------------------------------------------------------------------
+// Whale tracking — detects buy/sell trades from real transaction data for a
+// small rotating batch of tracked tokens each cycle (see
+// lib/solana/whale-transactions.js for the detection method and its
+// documented limitations). Deliberately bounded in scope and RPC usage —
+// this is a secondary feature sharing the same rate-limited RPC budget as
+// core token discovery.
+// ---------------------------------------------------------------------------
+
+async function checkWhaleActivityBatch(solPriceUsd) {
+  const now = Date.now();
+  const candidates = Array.from(trackedAddresses).filter((address) => {
+    const since = trackedSince.get(address);
+    return since && now - since < DENSE_SNAPSHOT_WINDOW_MS && pairAddressByAddress.get(address);
+  });
+
+  const batch = candidates.slice(0, WHALE_SCAN_BATCH_SIZE);
+
+  for (const tokenAddress of batch) {
+    try {
+      const pairAddress = pairAddressByAddress.get(tokenAddress);
+      const sinceSignature = await getTokenWhaleScanCursor(tokenAddress);
+      const discoveredAt = trackedSince.get(tokenAddress);
+
+      const { trades, newestSignature } = await scanForWhaleTrades({
+        pairAddress,
+        tokenAddress,
+        sinceSignature,
+        solPriceUsd
+      });
+
+      for (const trade of trades) {
+        const isEarlyBuy =
+          trade.direction === "buy" && discoveredAt && new Date(trade.tradedAt).getTime() - discoveredAt <= WHALE_EARLY_BUY_WINDOW_MS;
+
+        await insertWalletTrade({ ...trade, isEarlyBuy });
+      }
+
+      if (newestSignature && newestSignature !== sinceSignature) {
+        await setTokenWhaleScanCursor(tokenAddress, newestSignature);
+      }
+    } catch (err) {
+      log("whale scan failed for", tokenAddress, errMsg(err));
+    }
+  }
+}
+
+async function rescoreWallets() {
+  try {
+    const addresses = await getWalletsToScore();
+    for (const address of addresses) {
+      try {
+        const earlyBuys = await getEarlyBuysWithOutcomes(address);
+        const { smartScore, earlyBuyCount, earlyWinCount } = computeWalletScore(earlyBuys);
+        const totalBuyUsd = earlyBuys.reduce((sum, t) => sum + (t.usd_value || 0), 0);
+        await updateWalletScore(address, { smartScore, earlyBuyCount, earlyWinCount, totalBuyUsd });
+      } catch (err) {
+        log("wallet scoring failed for", address, errMsg(err));
+      }
+    }
+    log(`wallet scoring pass: ${addresses.length} wallets checked`);
+  } catch (err) {
+    log("wallet rescore pass failed:", errMsg(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fallback discovery (spec section 5) — only used while realtime is degraded
 // ---------------------------------------------------------------------------
 
@@ -488,6 +576,7 @@ async function loadExistingTokens() {
       trackedAddresses.add(token.address);
       const firstSeenMs = token.first_seen_at ? new Date(token.first_seen_at).getTime() : Date.now();
       trackedSince.set(token.address, firstSeenMs);
+      if (token.pair_address) pairAddressByAddress.set(token.address, token.pair_address);
     }
     log(`resumed tracking ${trackedAddresses.size} existing tokens`);
   } catch (err) {
@@ -656,6 +745,21 @@ async function main() {
   setInterval(() => {
     checkOutcomesDue().catch((err) => log("outcome check loop error:", errMsg(err)));
   }, OUTCOME_CHECK_INTERVAL_MS);
+
+  // Whale tracking: scan a small rotating batch of tracked tokens for
+  // buy/sell activity, then periodically recompute wallet scores from
+  // whatever's been detected so far.
+  setInterval(() => {
+    dexscreener
+      .getSolPriceUsd()
+      .catch(() => null)
+      .then((solPriceUsd) => checkWhaleActivityBatch(solPriceUsd))
+      .catch((err) => log("whale scan loop error:", errMsg(err)));
+  }, WHALE_SCAN_INTERVAL_MS);
+
+  setInterval(() => {
+    rescoreWallets().catch((err) => log("wallet rescore loop error:", errMsg(err)));
+  }, WALLET_RESCORE_INTERVAL_MS);
 
   process.on("SIGINT", () => {
     log("shutting down");
