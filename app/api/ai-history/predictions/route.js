@@ -1,14 +1,13 @@
-// app/api/ai-history/predictions/export/route.js
-// GET /api/ai-history/predictions/export — downloads the FULL prediction
-// history (not just one page) as a CSV file, so it can be checked manually
-// outside the dashboard (Excel/Google Sheets/etc).
+// app/api/ai-history/predictions/route.js
+// GET /api/ai-history/predictions?limit=&offset= — paginated prediction
+// history: one row per token with its discovery-time prediction and actual
+// outcome so far. "Note" is a factual, computed observation (rug detected,
+// signal direction matched/missed) — not a claimed AI-derived insight.
 
 import { NextResponse } from "next/server";
-import { getPredictionHistory } from "../../../../../lib/database/outcomes";
+import { getPredictionHistory } from "../../../../lib/database/outcomes";
 
 export const dynamic = "force-dynamic";
-
-const EXPORT_ROW_LIMIT = 5000;
 
 function pickLatestOutcome(row) {
   const horizons = ["24h", "6h", "4h", "1h", "30m", "15m", "5m", "1m"];
@@ -35,70 +34,37 @@ function buildNote(row, latest) {
     );
   }
 
-  return notes.length > 0 ? notes.join(" | ") : "";
+  return notes.length > 0 ? notes.join(" · ") : null;
 }
 
-// Wraps a value for safe CSV inclusion — quotes it and escapes any
-// internal quotes if it contains a comma, quote, or newline.
-function csvCell(value) {
-  const str = value === null || value === undefined ? "" : String(value);
-  if (/[",\n]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
-
-export async function GET() {
+export async function GET(request) {
   try {
-    const { rows } = await getPredictionHistory({ limit: EXPORT_ROW_LIMIT, offset: 0 });
+    const { searchParams } = new URL(request.url);
+    const limit = Math.min(Number(searchParams.get("limit")) || 50, 200);
+    const offset = Number(searchParams.get("offset")) || 0;
 
-    const header = [
-      "token_address",
-      "symbol",
-      "name",
-      "discovered_at",
-      "signal",
-      "opportunity_score",
-      "actual_horizon",
-      "actual_price_change_pct",
-      "result",
-      "finalized",
-      "note"
-    ];
+    const { rows, total } = await getPredictionHistory({ limit, offset });
 
-    const lines = [header.join(",")];
-
-    for (const row of rows) {
+    const predictions = rows.map((row) => {
       const latest = pickLatestOutcome(row);
-      const result = !latest ? "PENDING" : latest.value > 0 ? "WIN" : "LOSS";
-
-      lines.push(
-        [
-          csvCell(row.token_address),
-          csvCell(row.tokens?.symbol),
-          csvCell(row.tokens?.name),
-          csvCell(row.discovered_at),
-          csvCell(row.discovery_signal),
-          csvCell(row.discovery_opportunity_score),
-          csvCell(latest?.horizon),
-          csvCell(latest?.value),
-          csvCell(result),
-          csvCell(row.finalized_at ? "yes" : "no"),
-          csvCell(buildNote(row, latest))
-        ].join(",")
-      );
-    }
-
-    const csv = lines.join("\n");
-    const filename = `prediction-history-${new Date().toISOString().slice(0, 10)}.csv`;
-
-    return new NextResponse(csv, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/csv; charset=utf-8",
-        "Content-Disposition": `attachment; filename="${filename}"`
-      }
+      return {
+        tokenAddress: row.token_address,
+        symbol: row.tokens?.symbol || null,
+        name: row.tokens?.name || null,
+        imageUrl: row.tokens?.image_url || null,
+        discoveredAt: row.discovered_at,
+        prediction: {
+          signal: row.discovery_signal,
+          opportunityScore: row.discovery_opportunity_score
+        },
+        actual: latest ? { horizon: latest.horizon, priceChangePct: latest.value } : null,
+        result: !latest ? "PENDING" : latest.value > 0 ? "WIN" : "LOSS",
+        finalized: Boolean(row.finalized_at),
+        note: buildNote(row, latest)
+      };
     });
+
+    return NextResponse.json({ success: true, predictions, total, limit, offset });
   } catch (err) {
     return NextResponse.json({ success: false, error: err.message }, { status: 500 });
   }
