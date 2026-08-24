@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { formatCompactUsd, formatPrice, formatPercent, formatTokenAge, shortenAddress } from "../lib/utils/format";
 import { ScoreBadge, SignalBadge } from "./ScoreBadge";
+import { TokenLogo } from "./TokenLogo";
 import PriceChart from "./PriceChart";
 
 export default function TokenDetail({ address }) {
@@ -51,15 +52,18 @@ export default function TokenDetail({ address }) {
     <div className="container">
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div>
-            <h2 style={{ margin: 0 }}>
-              {token.name || "Unknown"} ({token.symbol || "?"})
-            </h2>
-            <div style={{ color: "var(--text-muted)", fontSize: 12, marginTop: 4 }}>
-              {shortenAddress(token.address, 6, 6)}{" "}
-              <button className="copy-btn" onClick={copyAddress}>
-                {copied ? "Copied" : "Copy"}
-              </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <TokenLogo imageUrl={token.imageUrl} symbol={token.symbol} size={44} />
+            <div>
+              <h2 style={{ margin: 0 }}>
+                {token.name || "Unknown"} ({token.symbol || "?"})
+              </h2>
+              <div style={{ color: "var(--text-muted)", fontSize: 12, marginTop: 4 }}>
+                {shortenAddress(token.address, 6, 6)}{" "}
+                <button className="copy-btn" onClick={copyAddress}>
+                  {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
             </div>
           </div>
           <ScoreBadge score={latestSnapshot?.opportunity_score} />
