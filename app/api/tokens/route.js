@@ -37,7 +37,7 @@ export async function GET(request) {
         name: token.name,
         symbol: token.symbol,
         dex: token.dex,
-        imageUrl: token.image_url,
+        imageUrl: token.image_url ?? null,
         pairAddress: token.pair_address,
         pairCreatedAt: token.pair_created_at,
         firstSeenAt: token.first_seen_at,
