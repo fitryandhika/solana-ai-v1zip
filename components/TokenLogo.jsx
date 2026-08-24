@@ -45,4 +45,4 @@ export function TokenLogo({ imageUrl, symbol, size = 32 }) {
       onError={() => setFailed(true)}
     />
   );
-}
+} 
