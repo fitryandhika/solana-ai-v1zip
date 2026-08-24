@@ -41,8 +41,9 @@ export function TokenLogo({ imageUrl, symbol, size = 32 }) {
     <img
       src={imageUrl}
       alt={symbol ? `${symbol} logo` : "Token logo"}
+      referrerPolicy="no-referrer"
       style={{ ...dimension, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
       onError={() => setFailed(true)}
     />
   );
-} 
+}
