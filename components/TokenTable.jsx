@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { formatCompactUsd, formatPrice, formatTokenAge } from "../lib/utils/format";
 import { ScoreBadge, SignalBadge } from "./ScoreBadge";
+import { TokenLogo } from "./TokenLogo";
 
 export default function TokenTable({ tokens }) {
   return (
@@ -27,9 +28,12 @@ export default function TokenTable({ tokens }) {
             <tr key={token.address}>
               <td>{idx + 1}</td>
               <td>
-                <Link href={`/token/${token.address}`}>
-                  <strong>{token.symbol || "?"}</strong>
-                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{token.name || "Unknown"}</div>
+                <Link href={`/token/${token.address}`} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <TokenLogo imageUrl={token.imageUrl} symbol={token.symbol} size={24} />
+                  <div>
+                    <strong>{token.symbol || "?"}</strong>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{token.name || "Unknown"}</div>
+                  </div>
                 </Link>
               </td>
               <td>{formatTokenAge(token.ageMinutes)}</td>
