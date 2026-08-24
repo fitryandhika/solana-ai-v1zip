@@ -23,7 +23,15 @@ require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env"
 
 const { SolanaDiscoveryStream } = require("../lib/solana/websocket");
 const dexscreener = require("../lib/providers/dexscreener");
-const { upsertToken, listRecentTokens, getCreatorHistory, getTotalTokenCount, getTokensMissingImage, updateTokenImage } = require("../lib/database/tokens");
+const {
+  upsertToken,
+  listRecentTokens,
+  getCreatorHistory,
+  getTotalTokenCount,
+  getTokensMissingImage,
+  updateTokenImage,
+  getWatchlistedAddresses
+} = require("../lib/database/tokens");
 const { insertSnapshot, getBaselineSnapshot, getSnapshotAtOrAfter, getFirstSnapshot, getTotalAnalyzedCount } = require("../lib/database/snapshots");
 const { getServiceClient } = require("../lib/database/supabase");
 const { calculateVolumeRatio, calculateMomentumScore, calculateBuyPressureScore } = require("../lib/analyzer/momentum");
@@ -566,6 +574,49 @@ async function backfillMissingImages() {
 }
 
 // ---------------------------------------------------------------------------
+// Watchlist sync — picks up tokens added to the watchlist via the API
+// (app/api/watchlist/route.js) while the scanner is already running, so
+// they start getting full tracking (snapshots, outcome checks, whale scan)
+// without needing a restart. Cheap: just a DB query, no RPC calls.
+// ---------------------------------------------------------------------------
+
+const WATCHLIST_SYNC_INTERVAL_MS = Number(process.env.WATCHLIST_SYNC_INTERVAL_MS || 2 * 60 * 1000);
+
+async function syncWatchlistedTokens() {
+  try {
+    const watchlisted = await getWatchlistedAddresses();
+    let added = 0;
+
+    for (const { address, pair_address: pairAddress } of watchlisted) {
+      if (trackedAddresses.has(address)) continue;
+
+      trackedAddresses.add(address);
+      trackedSince.set(address, Date.now());
+      if (pairAddress) pairAddressByAddress.set(address, pairAddress);
+      added += 1;
+
+      // Give it a baseline snapshot + outcome tracking right away, same as
+      // any other newly-tracked token.
+      const initialSnapshot = await analyzeAndSnapshot(address).catch((err) => {
+        log("watchlist sync: initial snapshot failed for", address, errMsg(err));
+        return null;
+      });
+
+      if (initialSnapshot) {
+        discoverySnapshotByAddress.set(address, { price: initialSnapshot.price, liquidity: initialSnapshot.liquidity });
+        computedHorizonsByAddress.set(address, new Set());
+      }
+    }
+
+    if (added > 0) {
+      log(`watchlist sync: started tracking ${added} newly watchlisted token(s)`);
+    }
+  } catch (err) {
+    log("watchlist sync failed:", errMsg(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap: resume tracking tokens already discovered in past runs
 // ---------------------------------------------------------------------------
 
@@ -734,6 +785,13 @@ async function main() {
     backfillMissingImages();
   }, IMAGE_BACKFILL_INTERVAL_MS);
 
+  // Pick up tokens added to the watchlist via the API — checked right away
+  // at startup, then periodically so additions don't wait for a restart.
+  syncWatchlistedTokens();
+  setInterval(() => {
+    syncWatchlistedTokens();
+  }, WATCHLIST_SYNC_INTERVAL_MS);
+
   // Periodically refresh snapshots for everything we're already tracking.
   setInterval(() => {
     pollTrackedTokens().catch((err) => log("poll loop error:", errMsg(err)));
@@ -773,4 +831,4 @@ async function main() {
 main().catch((err) => {
   log("fatal error, exiting:", err);
   process.exit(1);
-}); 
+});
