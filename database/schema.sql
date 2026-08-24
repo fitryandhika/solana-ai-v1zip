@@ -1,5 +1,5 @@
 -- ============================================================================
--- Solana AI V1 — Supabase schema (consolidated, includes migrations 002-007)
+-- Solana AI V1 — Supabase schema (consolidated, includes migrations 002-008)
 --
 -- How to use:
 --   1. Open your Supabase project.
@@ -10,7 +10,7 @@
 --   6. Start the app.
 --
 -- This file is the single source of truth for a FRESH setup. If your
--- project was set up before migrations 002-007 existed, you don't need to
+-- project was set up before migrations 002-008 existed, you don't need to
 -- re-run this — your database already has these columns from running the
 -- migration_00N_*.sql files directly. This file just keeps a from-scratch
 -- setup in sync with where the schema actually is today.
@@ -53,6 +53,11 @@ create table if not exists tokens (
   creator_prior_token_count               integer,
   creator_prior_rug_count                 integer,
   creator_prior_avg_price_change_pct_24h  numeric,
+
+  -- Whale-scan progress cursor (migration 008) — the last processed
+  -- transaction signature for this token's pair address, so the whale
+  -- scanner never reprocesses the same transactions twice.
+  whale_scan_cursor  text,
 
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now()
@@ -153,6 +158,56 @@ create index if not exists idx_outcomes_finalized_at on token_outcomes (finalize
 create index if not exists idx_outcomes_discovery_signal on token_outcomes (discovery_signal);
 
 -- ----------------------------------------------------------------------------
+-- wallet_trades / wallets: Whale Tracker (migration 008)
+--
+-- "Smart money" here means wallets that bought one of OUR tracked tokens
+-- early and that token's real recorded outcome (token_outcomes) was
+-- genuinely strongly positive. There is no external "trusted whale list" —
+-- every wallet's status is derived from our own verified data, OR
+-- explicitly marked source='manual' when the user adds one from an
+-- external source (e.g. Kolscan/MemeMoves) to watch before we have our own
+-- evidence for it. A wallet needs a minimum number of tracked early buys
+-- before it gets a score at all (see MIN_WALLET_TRADES_FOR_SCORE in
+-- lib/analyzer/whale-stats.js), so a single lucky trade never gets
+-- presented as a proven track record.
+-- ----------------------------------------------------------------------------
+create table if not exists wallet_trades (
+  id                uuid primary key default uuid_generate_v4(),
+  wallet_address    text not null,
+  token_address     text not null references tokens (address) on delete cascade,
+  signature         text not null unique,
+  direction         text not null, -- 'buy' | 'sell'
+  token_amount      numeric,
+  usd_value         numeric,
+  is_early_buy      boolean not null default false,
+  traded_at         timestamptz not null,
+  created_at        timestamptz not null default now()
+);
+
+create index if not exists idx_wallet_trades_wallet on wallet_trades (wallet_address);
+create index if not exists idx_wallet_trades_token on wallet_trades (token_address);
+create index if not exists idx_wallet_trades_traded_at on wallet_trades (traded_at desc);
+
+create table if not exists wallets (
+  address                 text primary key,
+  early_buy_count         integer not null default 0,
+  early_win_count         integer not null default 0,
+  smart_score             numeric, -- null = not enough data yet, never a fabricated default
+  total_buy_usd           numeric not null default 0,
+  last_trade_at           timestamptz,
+
+  -- 'system' = identified by our own early-buy/outcome evidence.
+  -- 'manual' = added by the user to watch immediately.
+  source                  text not null default 'system',
+  label                   text,
+
+  updated_at              timestamptz not null default now(),
+  created_at              timestamptz not null default now()
+);
+
+create index if not exists idx_wallets_smart_score on wallets (smart_score desc nulls last);
+
+-- ----------------------------------------------------------------------------
 -- scanner_status: SINGLETON status row for the background scanner.
 -- The app always reads/writes the row with this exact fixed id (see
 -- SCANNER_STATUS_ROW_ID in worker/scanner.js and app/api/scanner/route.js)
@@ -202,4 +257,9 @@ create trigger trg_scanner_status_updated_at
 drop trigger if exists trg_outcomes_updated_at on token_outcomes;
 create trigger trg_outcomes_updated_at
   before update on token_outcomes
+  for each row execute function set_updated_at();
+
+drop trigger if exists trg_wallets_updated_at on wallets;
+create trigger trg_wallets_updated_at
+  before update on wallets
   for each row execute function set_updated_at();
