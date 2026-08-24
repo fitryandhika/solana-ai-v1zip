@@ -9,8 +9,6 @@ import { listRecentTokens } from "../../../lib/database/tokens";
 import { getLatestSnapshotsForAllTokens } from "../../../lib/database/snapshots";
 import { computeTokenAgeMinutes } from "../../../lib/utils/format";
 
-// Force this route to run fresh on every request rather than being cached
-// as static output at build time (see app/api/scanner/route.js for why).
 export const dynamic = "force-dynamic";
 
 export async function GET(request) {
@@ -24,8 +22,6 @@ export async function GET(request) {
     const sort = searchParams.get("sort") || "score";
     const limit = searchParams.get("limit") ? Number(searchParams.get("limit")) : 100;
 
-    // Bound work to the tokens we're actually about to display, not the
-    // entire (ever-growing) tokens/snapshots tables.
     const tokens = await listRecentTokens(200);
     const addresses = tokens.map((t) => t.address);
     const snapshots = await getLatestSnapshotsForAllTokens({ addresses });
