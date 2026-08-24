@@ -1,4 +1,5 @@
 import "./globals.css";
+import BottomNav from "../components/BottomNav";
 
 export const metadata = {
   title: "Solana AI — Realtime Token Scanner",
@@ -9,7 +10,11 @@ export const metadata = {
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        {children}
+        <div className="bottom-nav-spacer" />
+        <BottomNav />
+      </body>
     </html>
   );
 }
