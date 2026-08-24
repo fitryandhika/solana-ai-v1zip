@@ -70,4 +70,4 @@ test("buildHorizonPatch includes liquidity fields and rug flag for 1h/24h", () =
 test("HORIZONS covers all required evaluation points", () => {
   const labels = HORIZONS.map((h) => h.label);
   assert.deepEqual(labels, ["1m", "5m", "15m", "30m", "1h", "4h", "6h", "24h"]);
-});
+}); 
