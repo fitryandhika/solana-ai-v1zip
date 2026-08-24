@@ -131,4 +131,4 @@ test("computeAiWhaleInsight returns null aiScore when no buyers have a score yet
   const result = computeAiWhaleInsight(topToken, buyTrades, new Map());
   assert.equal(result.aiScore, null);
   assert.equal(result.label, null);
-});
+}); 
