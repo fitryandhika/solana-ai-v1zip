@@ -727,6 +727,24 @@ function tryHandleCandidate(address, meta) {
 // Main
 // ---------------------------------------------------------------------------
 
+// Safety net: some errors from underlying libraries (e.g. a raw WebSocket-
+// level failure inside @solana/web3.js's Connection, which uses its own
+// internal EventEmitter) can surface as an uncaught exception or unhandled
+// rejection rather than something our own try/catch blocks can reach. Left
+// unhandled, Node kills the whole process on these — which then gets
+// restarted by Railway, immediately attempting a fresh connection again.
+// If the failure was itself connection-rate-limit related, that restart
+// cycle can repeatedly retrigger the same limit. Logging and continuing
+// here is safer for a long-running, idempotent worker like this one than
+// dying and restarting from scratch.
+process.on("unhandledRejection", (reason) => {
+  log("unhandled promise rejection (continuing):", errMsg(reason));
+});
+
+process.on("uncaughtException", (err) => {
+  log("uncaught exception (continuing):", errMsg(err));
+});
+
 async function main() {
   log("Solana AI scanner starting");
   await setStatus("OFFLINE");
