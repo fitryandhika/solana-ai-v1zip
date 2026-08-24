@@ -160,7 +160,12 @@ export default function AiHistoryDashboard() {
       </section>
 
       <section className="card">
-        <h3 style={{ marginTop: 0 }}>📋 Prediction History</h3>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h3 style={{ marginTop: 0 }}>📋 Prediction History</h3>
+          <a href="/api/ai-history/predictions/export" download className="copy-btn">
+            ⬇ Export CSV
+          </a>
+        </div>
         <div className="table-scroll">
           <table>
             <thead>
