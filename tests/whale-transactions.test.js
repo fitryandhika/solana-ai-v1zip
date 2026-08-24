@@ -70,4 +70,4 @@ test("parseSwapFromTransaction returns null usdValue when SOL price is unavailab
 test("parseSwapFromTransaction ignores balance changes for a different mint", () => {
   const tx = buildMockTx({ preAmount: 0, postAmount: 100, preLamports: 2000000000, postLamports: 0, mint: "SomeOtherMint" });
   assert.equal(parseSwapFromTransaction(tx, TOKEN_MINT, 150), null);
-});
+}); 
