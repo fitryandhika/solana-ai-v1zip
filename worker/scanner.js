@@ -23,7 +23,7 @@ require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env"
 
 const { SolanaDiscoveryStream } = require("../lib/solana/websocket");
 const dexscreener = require("../lib/providers/dexscreener");
-const { upsertToken, listRecentTokens, getCreatorHistory, getTotalTokenCount } = require("../lib/database/tokens");
+const { upsertToken, listRecentTokens, getCreatorHistory, getTotalTokenCount, getTokensMissingImage, updateTokenImage } = require("../lib/database/tokens");
 const { insertSnapshot, getBaselineSnapshot, getSnapshotAtOrAfter, getFirstSnapshot, getTotalAnalyzedCount } = require("../lib/database/snapshots");
 const { getServiceClient } = require("../lib/database/supabase");
 const { calculateVolumeRatio, calculateMomentumScore, calculateBuyPressureScore } = require("../lib/analyzer/momentum");
@@ -447,6 +447,37 @@ function stopTrendingPolling() {
 }
 
 // ---------------------------------------------------------------------------
+// Logo backfill — tokens discovered before the image feature existed (or
+// where DexScreener simply hadn't indexed artwork yet at discovery time)
+// never get an image_url otherwise, since a token's own upsert only runs
+// once, at discovery. This periodically checks a small batch and fills in
+// any that have since gotten a logo. Uses dexscreener.js's own built-in
+// request throttle — no extra rate-limit handling needed here.
+// ---------------------------------------------------------------------------
+
+const IMAGE_BACKFILL_INTERVAL_MS = Number(process.env.IMAGE_BACKFILL_INTERVAL_MS || 30 * 60 * 1000);
+const IMAGE_BACKFILL_BATCH_SIZE = Number(process.env.IMAGE_BACKFILL_BATCH_SIZE || 50);
+
+async function backfillMissingImages() {
+  try {
+    const addresses = await getTokensMissingImage(IMAGE_BACKFILL_BATCH_SIZE);
+    if (addresses.length === 0) return;
+
+    let filled = 0;
+    for (const address of addresses) {
+      const marketData = await dexscreener.getTokenByAddress(address);
+      if (marketData?.imageUrl) {
+        await updateTokenImage(address, marketData.imageUrl);
+        filled += 1;
+      }
+    }
+    log(`image backfill: checked ${addresses.length}, filled ${filled}`);
+  } catch (err) {
+    log("image backfill failed:", errMsg(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap: resume tracking tokens already discovered in past runs
 // ---------------------------------------------------------------------------
 
@@ -606,6 +637,13 @@ async function main() {
   // stream — it's not a fallback, it's a second, independent discovery
   // source for tokens that already exist but are showing renewed activity.
   startTrendingPolling();
+
+  // Fill in logos for tokens that didn't have one yet, then keep checking
+  // periodically for tokens whose artwork becomes available later.
+  backfillMissingImages();
+  setInterval(() => {
+    backfillMissingImages();
+  }, IMAGE_BACKFILL_INTERVAL_MS);
 
   // Periodically refresh snapshots for everything we're already tracking.
   setInterval(() => {
